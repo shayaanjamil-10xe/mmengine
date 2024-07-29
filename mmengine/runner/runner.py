@@ -51,11 +51,43 @@ from .loops import EpochBasedTrainLoop, IterBasedTrainLoop, TestLoop, ValLoop
 from .priority import Priority, get_priority
 from .utils import _get_batch_size, set_random_seed
 
+from aimet_torch.model_preparer import prepare_model
+from aimet_torch.batch_norm_fold import fold_all_batch_norms
+from aimet_common.defs import QuantScheme
+from aimet_torch.quantsim import QuantizationSimModel, quantsim
+
+
+
 ConfigType = Union[Dict, Config, ConfigDict]
 ParamSchedulerType = Union[List[_ParamScheduler], Dict[str,
                                                        List[_ParamScheduler]]]
 OptimWrapperType = Union[OptimWrapper, OptimWrapperDict]
 
+import torch
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from torchvision.transforms import ToTensor
+import cv2
+import os
+
+
+
+class CustomImageDataset(torch.utils.data.Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.images = os.listdir(root_dir)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.root_dir, self.images[idx])
+        image = cv2.imread(img_name)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if self.transform:
+            image = self.transform(image)
+        return image
 
 class _SlicedDataset:
 
@@ -71,6 +103,83 @@ class _SlicedDataset:
 
     def __len__(self):
         return self._length
+
+def train_step(self, data: Union[dict, tuple, list],
+                optim_wrapper: OptimWrapper) -> Dict[str, torch.Tensor]:
+    """Implements the default model training process including
+    preprocessing, model forward propagation, loss calculation,
+    optimization, and back-propagation.
+
+    During non-distributed training. If subclasses do not override the
+    :meth:`train_step`, :class:`EpochBasedTrainLoop` or
+    :class:`IterBasedTrainLoop` will call this method to update model
+    parameters. The default parameter update process is as follows:
+
+    1. Calls ``self.data_processor(data, training=False)`` to collect
+        batch_inputs and corresponding data_samples(labels).
+    2. Calls ``self(batch_inputs, data_samples, mode='loss')`` to get raw
+        loss
+    3. Calls ``self.parse_losses`` to get ``parsed_losses`` tensor used to
+        backward and dict of loss tensor used to log messages.
+    4. Calls ``optim_wrapper.update_params(loss)`` to update model.
+
+    Args:
+        data (dict or tuple or list): Data sampled from dataset.
+        optim_wrapper (OptimWrapper): OptimWrapper instance
+            used to update model parameters.
+
+    Returns:
+        Dict[str, torch.Tensor]: A ``dict`` of tensor for logging.
+    """
+    # Enable automatic mixed precision training context.
+    with optim_wrapper.optim_context(self):
+        data = self.data_preprocessor(data, True)
+        losses = self._run_forward(data, mode='loss')  # type: ignore
+    parsed_losses, log_vars = self.parse_losses(losses)  # type: ignore
+    optim_wrapper.update_params(parsed_losses)
+    return log_vars
+
+from typing import Tuple
+from mmengine.utils import is_list_of
+def parse_losses(
+    self, losses: Dict[str, torch.Tensor]
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Parses the raw outputs (losses) of the network.
+
+    Args:
+        losses (dict): Raw output of the network, which usually contain
+            losses and other necessary information.
+
+    Returns:
+        tuple[Tensor, dict]: There are two elements. The first is the
+        loss tensor passed to optim_wrapper which may be a weighted sum
+        of all losses, and the second is log_vars which will be sent to
+        the logger.
+    """
+    log_vars = []
+    for loss_name, loss_value in losses.items():
+        if isinstance(loss_value, torch.Tensor):
+            log_vars.append([loss_name, loss_value.mean()])
+        elif is_list_of(loss_value, torch.Tensor):
+            log_vars.append(
+                [loss_name,
+                    sum(_loss.mean() for _loss in loss_value)])
+        else:
+            raise TypeError(
+                f'{loss_name} is not a tensor or list of tensors')
+
+    loss = sum(value for key, value in log_vars if 'loss' in key)
+    log_vars.insert(0, ['loss', loss])
+    log_vars = OrderedDict(log_vars)  # type: ignore
+
+    return loss, log_vars  # type: ignore
+
+def _run_forward(self, data, mode='loss'):
+    batch_inputs = data['batch_inputs']
+    batch_data_samples = data['batch_data_samples']
+    x = self.extract_feat(batch_inputs)
+    losses = self.bbox_head.loss(x, batch_data_samples)
+    return losses
 
 
 @RUNNERS.register_module()
@@ -426,6 +535,7 @@ class Runner:
         if isinstance(model, dict) and data_preprocessor is not None:
             # Merge the data_preprocessor to model config.
             model.setdefault('data_preprocessor', data_preprocessor)
+
         self.model = self.build_model(model)
         # wrap model
         self.model = self.wrap_model(
@@ -446,6 +556,14 @@ class Runner:
 
         # dump `cfg` to `work_dir`
         self.dump_config()
+
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),  # Convert to tensor
+            transforms.Resize([640, 640]),  # Resize
+        ])
+        self.calibrationDataset = CustomImageDataset(root_dir='/datasets/COCO/images', transform=self.transform)
+        self.calibrationDataloader = DataLoader(self.calibrationDataset, batch_size=32, shuffle=True)
+
 
     @classmethod
     def from_cfg(cls, cfg: ConfigType) -> 'Runner':
@@ -1699,6 +1817,31 @@ class Runner:
             self.load_checkpoint(self._load_from)
             self._has_loaded = True
 
+    def pass_calibration_data(self, sim_model, use_cuda=False):
+        from tqdm import tqdm
+        data_loader = self.calibrationDataloader
+        batch_size = data_loader.batch_size
+
+        if use_cuda:
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+
+        sim_model.eval()
+        samples = 10
+
+        batch_cntr = 0
+        with torch.no_grad():
+            for input_data in tqdm(data_loader):
+
+                inputs_batch = input_data.to(device)
+                sim_model(inputs_batch)
+
+                batch_cntr += 1
+                print(f"batch_cntr = {batch_cntr}")
+                if (batch_cntr * batch_size) > samples:
+                    break
+
     def train(self) -> nn.Module:
         """Launch training.
 
@@ -1770,10 +1913,76 @@ class Runner:
             self._train_loop.iter,  # type: ignore
             self._train_loop.max_iters)  # type: ignore
 
-        # Maybe compile the model according to options in self.cfg.compile
-        # This must be called **AFTER** model has been wrapped.
+        ################CALLING AIMET HERE#############
+        print("*****"*20)
+        print("PREPARING MODEL FOR QAT")
+        print("*****"*20)
+
+        # print(self.model.forward(torch.tensor([1]), 2))
+        # print(self.model.forward)
+        # old_forward = self.model.forward
+        # self.model.forward = self.model.new_forward
+        # print(self.model.forward)
+        # import sys
+
+        old_loss = self.model.loss
+        self.model.loss = self.model._forward
+
+        print(self.model)
+
+        sim_model = prepare_model(self.model, modules_to_exclude=[nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d])
+        # sim_model = prepare_model(self.model)
+        
+
+        # _ = fold_all_batch_norms(sim_model, input_shapes=(1, 3, 224, 224))
+
+        dummy_input = torch.rand(1, 3, 640, 640)  # Shape for each ImageNet sample is (3 channels) x (224 height) x (224 width)
+        # # if use_cuda:
+        # #     dummy_input = dummy_input.cuda()
+
+        print("constructor called for Quant Sim Model")
+        sim = QuantizationSimModel(model=sim_model,
+                                quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                dummy_input=dummy_input,
+                                default_output_bw=8,
+                                default_param_bw=8)
+
+
+        # sim.compute_encodings(forward_pass_callback=self.pass_calibration_data,
+        #               forward_pass_callback_args=False)
+        
+        # sim.export(path='/home/shayaanjamil/Desktop/aimet/rtm_det_qat_sim', filename_prefix='rtm_det_after_encodings', dummy_input=dummy_input)
+
+        # sim = quantsim.load_checkpoint("/home/shayaanjamil/Desktop/aimet/rtm_det_qat_sim")
+
+        print("***"*10)
+        print("QAT FINISHED AND EXPORTED")
+        print("***"*10)
+
+        bbox_loss = self.model.bbox_head.loss
+        def _run_forward(self, data, mode):
+            batch_inputs = data['inputs']
+            batch_data_samples = data['data_samples']
+            x = sim.model(batch_inputs)
+            print("RUN FORWARD CALLEDDDDD")
+            print(x)
+            losses = bbox_loss(x, batch_data_samples)
+            return losses
+        import types
+
+        self.model.loss = old_loss
+        self.model = sim.model
+        self.model.train_step = types.MethodType(train_step, self.model)
+        self.model.data_preprocessor = MODELS.build(self.cfg.get('model').get('data_preprocessor'))
+        self.parse_losses = types.MethodType(parse_losses, self.model)
+        self.model._run_forward = types.MethodType(_run_forward, self.model)
+
+        self.model = self.model.train()
         self._maybe_compile('train_step')
 
+        print("training started")
+        print("FINALLY")
+        print("---___---"*5)
         model = self.train_loop.run()  # type: ignore
         self.call_hook('after_run')
         return model
@@ -1816,7 +2025,7 @@ class Runner:
         self._test_loop = self.build_test_loop(self._test_loop)  # type: ignore
 
         self.call_hook('before_run')
-
+        
         # make sure checkpoint-related hooks are triggered after `before_run`
         self.load_or_resume()
 
