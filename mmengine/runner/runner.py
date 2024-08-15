@@ -1844,7 +1844,7 @@ class Runner:
             device = torch.device('cpu')
 
         sim_model.eval()
-        samples = 1
+        samples = 1000
 
         batch_cntr = 0
         with torch.no_grad():
