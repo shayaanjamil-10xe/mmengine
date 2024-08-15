@@ -472,8 +472,15 @@ class CheckpointHook(Hook):
         else:
             step = runner.iter + 1
             meta = dict(epoch=runner.epoch, iter=step)
-
-        self._save_checkpoint_with_step(runner, step, meta=meta)
+        
+        import torch
+        import os
+        dummy_input = torch.rand(1, 3, 640, 640)
+        os.makedirs(f"/teamspace/studios/this_studio/mmdetection/rtm_export_{str(step)}", exist_ok=True)        
+        runner.model.export(path=f"/teamspace/studios/this_studio/mmdetection/rtm_export_{str(step)}",
+           filename_prefix="rtm_det",
+           dummy_input=dummy_input.cpu())
+        # self._save_checkpoint_with_step(runner, step, meta=meta)
 
     def _save_best_checkpoint(self, runner, metrics) -> None:
         """Save the current checkpoint and delete outdated checkpoint.
@@ -576,7 +583,12 @@ class CheckpointHook(Hook):
         # not the current best checkpoint which causes the current best
         # checkpoint can not be removed when resuming training.
         if best_ckpt_updated and self.last_ckpt is not None:
-            self._save_checkpoint_with_step(runner, cur_time, meta)
+            import torch
+            dummy_input = torch.rand(1, 3, 640, 640)
+            runner.model.export(path=f"/teamspace/studios/this_studio/mmdetection/rtm_export_{str(cur_time)}",
+            filename_prefix="rtm_det",
+            dummy_input=dummy_input.cpu())
+            # self._save_checkpoint_with_step(runner, cur_time, meta)
 
     def _init_rule(self, rules, key_indicators) -> None:
         """Initialize rule, key_indicator, comparison_func, and best score. If

@@ -110,7 +110,7 @@ class EpochBasedTrainLoop(BaseLoop):
     def run_epoch(self) -> None:
         """Iterate one epoch."""
         self.runner.call_hook('before_train_epoch')
-        self.runner.model.train()
+        self.runner.model.model.train()
         for idx, data_batch in enumerate(self.dataloader):
             self.run_iter(idx, data_batch)
 

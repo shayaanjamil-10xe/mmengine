@@ -104,37 +104,53 @@ class _SlicedDataset:
     def __len__(self):
         return self._length
 
+def _exclude_modules_from_quant(model, sim, modules_to_ignore):
+    name_to_quant_wrapper_dict = {}
+    for name, module in sim.model.named_modules():
+        name_to_quant_wrapper_dict[name] = module
+
+    module_to_name_dict = {}
+    for name, module in model.named_modules():
+        module_to_name_dict[module] = name
+
+    quant_wrappers_to_ignore = []
+    for module in modules_to_ignore:
+        name = module_to_name_dict[module]
+        quant_wrapper = name_to_quant_wrapper_dict[name]
+        quant_wrappers_to_ignore.append(quant_wrapper)
+
+    sim.exclude_layers_from_quantization(quant_wrappers_to_ignore)
+
+from mmdet.models.utils import (unpack_gt_instances)
+def loss(bbox_head, x, batch_data_samples):
+    outs = bbox_head(x)
+    outputs = unpack_gt_instances(batch_data_samples)
+    (batch_gt_instances, batch_gt_instances_ignore,
+        batch_img_metas) = outputs
+    
+    temp_outputs = []
+    for o in outs:
+        temp_o = []
+        for t in o:
+            temp_o.append(t.cpu())
+        temp_outputs.append(temp_o)
+    
+    loss_inputs = temp_outputs + [batch_gt_instances, batch_img_metas,
+                            batch_gt_instances_ignore]
+
+    losses = bbox_head.loss_by_feat(*loss_inputs)
+
+    return losses
+
 def train_step(self, data: Union[dict, tuple, list],
                 optim_wrapper: OptimWrapper) -> Dict[str, torch.Tensor]:
-    """Implements the default model training process including
-    preprocessing, model forward propagation, loss calculation,
-    optimization, and back-propagation.
-
-    During non-distributed training. If subclasses do not override the
-    :meth:`train_step`, :class:`EpochBasedTrainLoop` or
-    :class:`IterBasedTrainLoop` will call this method to update model
-    parameters. The default parameter update process is as follows:
-
-    1. Calls ``self.data_processor(data, training=False)`` to collect
-        batch_inputs and corresponding data_samples(labels).
-    2. Calls ``self(batch_inputs, data_samples, mode='loss')`` to get raw
-        loss
-    3. Calls ``self.parse_losses`` to get ``parsed_losses`` tensor used to
-        backward and dict of loss tensor used to log messages.
-    4. Calls ``optim_wrapper.update_params(loss)`` to update model.
-
-    Args:
-        data (dict or tuple or list): Data sampled from dataset.
-        optim_wrapper (OptimWrapper): OptimWrapper instance
-            used to update model parameters.
-
-    Returns:
-        Dict[str, torch.Tensor]: A ``dict`` of tensor for logging.
-    """
-    # Enable automatic mixed precision training context.
     with optim_wrapper.optim_context(self):
         data = self.data_preprocessor(data, True)
-        losses = self._run_forward(data, mode='loss')  # type: ignore
+        inputs = data['inputs'].cuda()
+        data_samples = data['data_samples']
+        outs = self.model(inputs)
+        losses = loss(self.bbox_head, outs, data_samples)
+
     parsed_losses, log_vars = self.parse_losses(losses)  # type: ignore
     optim_wrapper.update_params(parsed_losses)
     return log_vars
@@ -561,8 +577,8 @@ class Runner:
             transforms.ToTensor(),  # Convert to tensor
             transforms.Resize([640, 640]),  # Resize
         ])
-        self.calibrationDataset = CustomImageDataset(root_dir='/datasets/COCO/images', transform=self.transform)
-        self.calibrationDataloader = DataLoader(self.calibrationDataset, batch_size=32, shuffle=True)
+        self.calibrationDataset = CustomImageDataset(root_dir='/teamspace/studios/aimet/COCO/images', transform=self.transform)
+        self.calibrationDataloader = DataLoader(self.calibrationDataset, batch_size=4, shuffle=True)
 
 
     @classmethod
@@ -1817,7 +1833,7 @@ class Runner:
             self.load_checkpoint(self._load_from)
             self._has_loaded = True
 
-    def pass_calibration_data(self, sim_model, use_cuda=False):
+    def pass_calibration_data(self, sim_model, use_cuda=True):
         from tqdm import tqdm
         data_loader = self.calibrationDataloader
         batch_size = data_loader.batch_size
@@ -1828,13 +1844,13 @@ class Runner:
             device = torch.device('cpu')
 
         sim_model.eval()
-        samples = 10
+        samples = 1
 
         batch_cntr = 0
         with torch.no_grad():
             for input_data in tqdm(data_loader):
 
-                inputs_batch = input_data.to(device)
+                inputs_batch = input_data.cuda()
                 sim_model(inputs_batch)
 
                 batch_cntr += 1
@@ -1914,75 +1930,44 @@ class Runner:
             self._train_loop.max_iters)  # type: ignore
 
         ################CALLING AIMET HERE#############
-        print("*****"*20)
-        print("PREPARING MODEL FOR QAT")
-        print("*****"*20)
+        self.logger.info("PREPARING MODEL FOR AIMET")
 
-        # print(self.model.forward(torch.tensor([1]), 2))
-        # print(self.model.forward)
-        # old_forward = self.model.forward
-        # self.model.forward = self.model.new_forward
-        # print(self.model.forward)
-        # import sys
+        sim_model = prepare_model(self.model)
+        _ = fold_all_batch_norms(sim_model, input_shapes=(1, 3, 640, 640))
+        dummy_input = torch.rand(1, 3, 640, 640).cuda()
 
-        old_loss = self.model.loss
-        self.model.loss = self.model._forward
+        module_names = dict(sim_model.named_modules())
+        modules_to_ignore = ['backbone.stage2.1.blocks.0.conv2.pointwise_conv.conv'] + [m for m in module_names.keys() if "batch_norm" in m]
+        # modules_to_ignore = ['backbone.stage2.1.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_14', 'backbone.stage1.1.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_7', 'backbone.stage2.1.blocks.0.conv2.pointwise_conv.conv', 'backbone.stage3.1.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_21', 'backbone.stage4.2.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_30', 'neck.top_down_blocks.0.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_37', 'neck.top_down_blocks.1.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_44', 'neck.bottom_up_blocks.0.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_51', 'neck.bottom_up_blocks.1.blocks.0.conv2.depthwise_conv.bn.module_batch_norm_58']
+        # modules_to_ignore = ['module_batch_norm_14', 'module_batch_norm_7', 'backbone.stage2.1.blocks.0.conv2.pointwise_conv.conv', 'module_batch_norm_21', 'module_batch_norm_30', 'module_batch_norm_37', 'module_batch_norm_44', 'module_batch_norm_51', 'module_batch_norm_58']
+        self.logger.info(f"Number of modules ignored {len(modules_to_ignore)}")
+        modules_to_ignore = [module_names[m] for m in modules_to_ignore]
 
-        print(self.model)
-
-        sim_model = prepare_model(self.model, modules_to_exclude=[nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d])
-        # sim_model = prepare_model(self.model)
-        
-
-        # _ = fold_all_batch_norms(sim_model, input_shapes=(1, 3, 224, 224))
-
-        dummy_input = torch.rand(1, 3, 640, 640)  # Shape for each ImageNet sample is (3 channels) x (224 height) x (224 width)
-        # # if use_cuda:
-        # #     dummy_input = dummy_input.cuda()
-
-        print("constructor called for Quant Sim Model")
+        self.logger.info("constructor called for Quant Sim Model")
         sim = QuantizationSimModel(model=sim_model,
                                 quant_scheme=QuantScheme.post_training_tf_enhanced,
                                 dummy_input=dummy_input,
                                 default_output_bw=8,
                                 default_param_bw=8)
-
-
-        # sim.compute_encodings(forward_pass_callback=self.pass_calibration_data,
-        #               forward_pass_callback_args=False)
+        # sim.load_encodings("/teamspace/studios/aimet/aimet/Examples/torch/quantization/sim_model_excluded_modules/rtm_det.encodings")
+        sim.compute_encodings(forward_pass_callback=self.pass_calibration_data,
+                      forward_pass_callback_args=False)
+        self.logger.info("Encoding computed")
+        _exclude_modules_from_quant(sim_model, sim, modules_to_ignore)
+        self.logger.info("MODULESS SUCCESSSFULLY EXCLUDED")
         
-        # sim.export(path='/home/shayaanjamil/Desktop/aimet/rtm_det_qat_sim', filename_prefix='rtm_det_after_encodings', dummy_input=dummy_input)
-
-        # sim = quantsim.load_checkpoint("/home/shayaanjamil/Desktop/aimet/rtm_det_qat_sim")
-
-        print("***"*10)
-        print("QAT FINISHED AND EXPORTED")
-        print("***"*10)
-
-        bbox_loss = self.model.bbox_head.loss
-        def _run_forward(self, data, mode):
-            batch_inputs = data['inputs']
-            batch_data_samples = data['data_samples']
-            x = sim.model(batch_inputs)
-            print("RUN FORWARD CALLEDDDDD")
-            print(x)
-            losses = bbox_loss(x, batch_data_samples)
-            return losses
         import types
-
-        self.model.loss = old_loss
-        self.model = sim.model
+        bbox_head = self.model.bbox_head
+        self.model = sim
         self.model.train_step = types.MethodType(train_step, self.model)
+        self.model.bbox_head = bbox_head
         self.model.data_preprocessor = MODELS.build(self.cfg.get('model').get('data_preprocessor'))
-        self.parse_losses = types.MethodType(parse_losses, self.model)
-        self.model._run_forward = types.MethodType(_run_forward, self.model)
+        self.model.parse_losses = types.MethodType(parse_losses, self.model)
 
-        self.model = self.model.train()
+        self.model.model = self.model.model.train()
         self._maybe_compile('train_step')
 
-        print("training started")
-        print("FINALLY")
-        print("---___---"*5)
+        self.logger.info("TRAINING STARTED")
         model = self.train_loop.run()  # type: ignore
         self.call_hook('after_run')
         return model
