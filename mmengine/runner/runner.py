@@ -1945,7 +1945,7 @@ class Runner:
 
         self.logger.info("constructor called for Quant Sim Model")
         sim = QuantizationSimModel(model=sim_model,
-                                quant_scheme=QuantScheme.post_training_tf_enhanced,
+                                quant_scheme=QuantScheme.training_range_learning_with_tf_init,
                                 dummy_input=dummy_input,
                                 default_output_bw=8,
                                 default_param_bw=8)
